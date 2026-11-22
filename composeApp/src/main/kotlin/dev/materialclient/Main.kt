@@ -4,6 +4,7 @@ import kotlin.coroutines.coroutineContext
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.foundation.layout.*
@@ -258,14 +259,14 @@ private object OfflineAccountPreferences {
 
 private object VersionRepository {
     suspend fun fetch(): List<GameVersion> = withContext(Dispatchers.IO) {
-        val connection = URL(
-            "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
-        ).openConnection().apply {
-            connectTimeout = 8000
-            readTimeout = 8000
-        }
-
-        val json = connection.getInputStream().bufferedReader().use { it.readText() }
+        // Через общий сетевой слой: учитывает прокси и переходит на зеркало, если сайт Mojang недоступен.
+        val manifestUrl = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+        val json = Net.fetchFirst(
+            listOfNotNull(
+                Net.Source(manifestUrl, false) { it },
+                JavaRuntimes.mirrorOf(manifestUrl)?.let { Net.Source(it, true) { text -> text } }
+            )
+        )
 
         // Разбираем манифест как JSON, а не регулярным выражением: порядок полей в нём не гарантирован.
         JsonParser.parseString(json).asJsonObject
@@ -309,22 +310,13 @@ internal object MinecraftInstaller {
     )
 
     private fun readJson(url: String): JsonObject {
-        val connection = URL(url).openConnection() as HttpURLConnection
-        try {
-            connection.connectTimeout = 15000
-            connection.readTimeout = 30000
-            connection.setRequestProperty("User-Agent", "MaterialClient/0.1")
-
-            check(connection.responseCode in 200..299) {
-                "HTTP ${connection.responseCode}: $url"
-            }
-
-            return connection.inputStream.bufferedReader().use {
-                JsonParser.parseReader(it).asJsonObject
-            }
-        } finally {
-            connection.disconnect()
-        }
+        val parse = { text: String -> JsonParser.parseString(text).asJsonObject }
+        return Net.fetchFirst(
+            listOfNotNull(
+                Net.Source(url, false, parse),
+                JavaRuntimes.mirrorOf(url)?.let { Net.Source(it, true, parse) }
+            )
+        )
     }
 
     private fun sha1(file: File): String {
@@ -1111,6 +1103,7 @@ fun App() {
     val scope = rememberCoroutineScope()
     var installJob by remember { mutableStateOf<Job?>(null) }
     var modQuery by remember { mutableStateOf("") }
+    var instanceQuery by remember { mutableStateOf("") }
     var mods by remember { mutableStateOf<List<ModrinthMod>>(emptyList()) }
     var modsLoading by remember { mutableStateOf(false) }
     var modsError by remember { mutableStateOf<String?>(null) }
@@ -1182,6 +1175,81 @@ fun App() {
         mutableStateOf("")
     }
 
+    var updateInfo by remember { mutableStateOf<UpdateInfo?>(null) }
+    var updateStatus by remember { mutableStateOf("") }
+    var updateChecking by remember { mutableStateOf(false) }
+    var updateDownloading by remember { mutableStateOf(false) }
+    var updateProgress by remember { mutableStateOf(0f) }
+    var updateDismissed by remember { mutableStateOf(false) }
+    var autoUpdateCheck by remember { mutableStateOf(GameSettings.autoUpdateCheck) }
+
+    suspend fun checkUpdates(manual: Boolean) {
+        val repo = AppInfo.updateRepo()
+        if (!Updater.isValidRepo(repo)) {
+            if (manual) updateStatus = tr("Укажи репозиторий в виде «владелец/имя».")
+            return
+        }
+        updateChecking = true
+        if (manual) updateStatus = tr("Проверяем обновления…")
+        try {
+            val found = withContext(Dispatchers.IO) { Updater.check(repo) }
+            updateInfo = found
+            updateDismissed = false
+            if (manual) {
+                updateStatus = if (found == null) tr("У тебя последняя версия: {0}", AppInfo.VERSION)
+                else tr("Доступна версия {0}", found.version)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (manual) updateStatus = tr("Не удалось проверить обновления: {0}", e.message ?: tr("ошибка"))
+        } finally {
+            updateChecking = false
+        }
+    }
+
+    fun installUpdate() {
+        val info = updateInfo ?: return
+        if (updateDownloading) return
+        if (installing || gameRunning) {
+            updateStatus = tr("Сначала дождись конца установки или закрой игру.")
+            return
+        }
+        if (info.assetUrl == null) {
+            // В релизе нет установщика: открываем страницу релиза, чтобы скачать вручную.
+            try {
+                java.awt.Desktop.getDesktop().browse(java.net.URI(info.pageUrl))
+            } catch (e: Exception) {
+                updateStatus = tr("Не удалось открыть страницу: {0}", e.message ?: tr("ошибка"))
+            }
+            return
+        }
+        updateDownloading = true
+        updateProgress = 0f
+        updateStatus = tr("Скачиваем обновление…")
+        scope.launch {
+            try {
+                val repo = AppInfo.updateRepo()
+                val file = withContext(Dispatchers.IO) {
+                    Updater.download(repo, info) { done, total ->
+                        if (total > 0) updateProgress = (done.toFloat() / total).coerceIn(0f, 1f)
+                    }
+                }
+                updateStatus = tr("Запускаем установщик…")
+                withContext(Dispatchers.IO) { java.awt.Desktop.getDesktop().open(file) }
+                // Установщик заменяет файлы лаунчера, поэтому сам лаунчер закрывается.
+                kotlinx.coroutines.delay(800)
+                System.exit(0)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                updateStatus = tr("Не удалось скачать обновление: {0}", e.message ?: tr("ошибка"))
+            } finally {
+                updateDownloading = false
+            }
+        }
+    }
+
     // Сообщения, которые уже появились на экране, остались бы на прежнем языке, поэтому при смене языка
     // они обновляются или сбрасываются. Новые сообщения сразу создаются на выбранном языке.
     fun setLanguage(code: String) {
@@ -1206,6 +1274,7 @@ fun App() {
         gameStatus = if (gameRunning) tr("Minecraft запущен…") else tr("Игра не запущена")
         microsoftStatus = if (microsoftBusy) tr("Ожидаем подтверждения в браузере…") else tr("Не выполнен вход")
         accountStatus = ""
+        if (!updateDownloading) updateStatus = ""
         javaSettingsStatus = ""
         launchSettingsStatus = ""
         proxyStatus = ""
@@ -1217,15 +1286,29 @@ fun App() {
     }
 
     LaunchedEffect(Unit) {
-        try {
-            versions = VersionRepository.fetch()
-            versionStatus = tr("Версий загружено: {0}", versions.size)
-            if (versions.isNotEmpty() && versions.none { it.id == newVersion }) {
-                newVersion = versions.firstOrNull { it.type == "release" }?.id ?: versions.first().id
-                newName = "Minecraft $newVersion"
+        if (autoUpdateCheck) {
+            kotlinx.coroutines.delay(3_000)
+            checkUpdates(manual = false)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        // Если сеть ещё не поднялась (запуск вместе с системой), пробуем ещё несколько раз.
+        for (attempt in 1..4) {
+            try {
+                versions = VersionRepository.fetch()
+                versionStatus = tr("Версий загружено: {0}", versions.size)
+                if (versions.isNotEmpty() && versions.none { it.id == newVersion }) {
+                    newVersion = versions.firstOrNull { it.type == "release" }?.id ?: versions.first().id
+                    newName = "Minecraft $newVersion"
+                }
+                break
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                versionStatus = tr("Не удалось загрузить версии. Проверь интернет.")
+                if (attempt < 4) kotlinx.coroutines.delay(5_000L * attempt)
             }
-        } catch (e: Exception) {
-            versionStatus = tr("Не удалось загрузить версии. Проверь интернет.")
         }
     }
 
@@ -1305,13 +1388,6 @@ fun App() {
                             fontSize = 11.sp,
                             maxLines = 1
                         )
-                        Text(
-                            "PRISM-INSPIRED",
-                            color = TextMuted,
-                            letterSpacing = 1.sp,
-                            fontSize = 8.sp,
-                            maxLines = 1
-                        )
                     }
                 }
 
@@ -1386,6 +1462,36 @@ fun App() {
                     )
                     .padding(horizontal = 30.dp, vertical = 26.dp)
             ) {
+                updateInfo?.takeIf { !updateDismissed }?.let { info ->
+                    Surface(
+                        color = AccentSoft,
+                        shape = RoundedCornerShape(14.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Accent.copy(alpha = 0.4f)),
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 14.dp)
+                    ) {
+                        Row(
+                            Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Download, contentDescription = null, tint = Accent)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(tr("Доступна новая версия {0}", info.version), color = TextMain, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    if (updateDownloading) tr("Скачиваем… {0}%", (updateProgress * 100).toInt())
+                                    else updateStatus.ifBlank { tr("Сейчас у тебя {0}", AppInfo.VERSION) },
+                                    color = if (I18n.isProblem(updateStatus)) MaterialTheme.colorScheme.error else TextMuted,
+                                    fontSize = 12.sp,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            TextButton(onClick = { updateDismissed = true }, enabled = !updateDownloading) { Text(tr("Позже")) }
+                            Button(onClick = { installUpdate() }, enabled = !updateDownloading) { Text(tr("Обновить лаунчер")) }
+                        }
+                    }
+                }
+
                 if (currentPage == "Экземпляры") {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1428,7 +1534,25 @@ fun App() {
 
                 when (currentPage) {
                     "Экземпляры" -> {
-                        Spacer(Modifier.height(20.dp))
+                        Spacer(Modifier.height(14.dp))
+                        if (profiles.size > 1) {
+                            OutlinedTextField(
+                                value = instanceQuery,
+                                onValueChange = { instanceQuery = it },
+                                label = { Text(tr("Найти экземпляр")) },
+                                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
+                                trailingIcon = {
+                                    if (instanceQuery.isNotEmpty()) {
+                                        IconButton(onClick = { instanceQuery = "" }) {
+                                            Icon(Icons.Default.Close, contentDescription = null)
+                                        }
+                                    }
+                                },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        Spacer(Modifier.height(14.dp))
                     }
 
                     "Каталог модов" -> {
@@ -1437,16 +1561,7 @@ fun App() {
                             color = TextMuted
                         )
 
-                        Spacer(Modifier.height(20.dp))
-
-                        Text(
-                            tr("Каталог модов"),
-                            fontSize = 22.sp,
-                            color = TextMain,
-                            fontWeight = FontWeight.SemiBold
-                        )
-
-                        Spacer(Modifier.height(12.dp))
+                        Spacer(Modifier.height(16.dp))
 
                         // Каталог сам подбирает моды под версию Minecraft и загрузчик выбранного экземпляра.
                         val catalogTarget = profiles.firstOrNull { it.name == modTargetInstance }
@@ -1470,7 +1585,11 @@ fun App() {
                         LaunchedEffect(modTargetInstance, catalogTarget?.loader) {
                             ModLoaders.canonical(catalogTarget?.loader)?.let { modLoaderFilter = it }
                         }
-                        LaunchedEffect(modTargetInstance, catalogTarget?.version, modLoaderFilter) { loadMods() }
+                        // Поиск запускается сам через долю секунды после последнего символа (кнопка «Найти» остаётся).
+                        LaunchedEffect(modTargetInstance, catalogTarget?.version, modLoaderFilter, modQuery) {
+                            kotlinx.coroutines.delay(350)
+                            loadMods()
+                        }
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(tr("Установить в:"), color = TextMuted)
                             var targetMenuExpanded by remember { mutableStateOf(false) }
@@ -1919,9 +2038,9 @@ fun App() {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 4.dp)) {
                             listOf(
                                 "look" to "Внешний вид",
-                                "accounts" to "Аккаунты",
                                 "java" to "Java и память",
-                                "network" to "Сеть"
+                                "network" to "Сеть",
+                                "about" to "О лаунчере"
                             ).forEach { (tabId, tabLabel) ->
                                 val tabSelected = settingsTab == tabId
                                 Surface(
@@ -2086,193 +2205,6 @@ fun App() {
                             steps = 3,
                             modifier = Modifier.fillMaxWidth()
                         )
-
-                        }
-
-                        if (settingsTab == "accounts") {
-                        Text(
-                            tr("Офлайн-аккаунт"),
-                            fontSize = 18.sp,
-                            color = TextMain,
-                            fontWeight = FontWeight.SemiBold
-                        )
-
-                        Spacer(Modifier.height(8.dp))
-
-                        Text(
-                            tr("Используется для серверов, разрешающих offline-вход"),
-                            color = TextMuted,
-                            fontSize = 13.sp
-                        )
-
-                        Spacer(Modifier.height(8.dp))
-
-                        OutlinedTextField(
-                            value = offlineUsername,
-                            onValueChange = {
-                                offlineUsername = it
-                                accountStatus = ""
-                            },
-                            label = { Text(tr("Ник игрока")) },
-                            singleLine = true,
-                            isError = OfflineAccountPreferences.validateUsername(
-                                offlineUsername
-                            ) != null,
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        Spacer(Modifier.height(8.dp))
-
-                        Button(
-                            onClick = {
-                                val problem =
-                                    OfflineAccountPreferences.validateUsername(offlineUsername)
-
-                                if (problem != null) {
-                                    accountStatus = problem
-                                } else {
-                                    try {
-                                        OfflineAccountPreferences.saveUsername(
-                                            offlineUsername
-                                        )
-                                        accountStatus = tr("Офлайн-ник сохранён")
-                                        status = tr("Офлайн-аккаунт настроен")
-                                    } catch (e: Exception) {
-                                        accountStatus =
-                                            tr("Ошибка сохранения: {0}", e.message ?: tr("неизвестная ошибка"))
-                                    }
-                                }
-                            }
-                        ) {
-                            Icon(Icons.Default.Save, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(tr("Сохранить ник"))
-                        }
-
-                        if (accountStatus.isNotBlank()) {
-                            Text(
-                                accountStatus,
-                                color = if (I18n.isProblem(accountStatus)) MaterialTheme.colorScheme.error else Accent,
-                                fontSize = 12.sp
-                            )
-                        }
-
-                        Spacer(Modifier.height(24.dp))
-
-                        Text(
-                            tr("Аккаунт Microsoft"),
-                            fontSize = 18.sp,
-                            color = TextMain,
-                            fontWeight = FontWeight.SemiBold
-                        )
-
-                        Spacer(Modifier.height(8.dp))
-
-                        Text(
-                            microsoftStatus,
-                            color = TextMuted,
-                            fontSize = 13.sp
-                        )
-
-                        if (microsoftCode.isNotBlank()) {
-                            Spacer(Modifier.height(8.dp))
-
-                            Text(
-                                tr("Код подтверждения: {0}", microsoftCode),
-                                color = Accent,
-                                fontSize = 20.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-
-                            if (microsoftVerificationUrl.isNotBlank()) {
-                                TextButton(
-                                    onClick = {
-                                        try {
-                                            if (Desktop.isDesktopSupported()) {
-                                                Desktop.getDesktop().browse(
-                                                    URI(microsoftVerificationUrl)
-                                                )
-                                            } else {
-                                                microsoftStatus =
-                                                    tr("Открой ссылку вручную: {0}", microsoftVerificationUrl)
-                                            }
-                                        } catch (e: Exception) {
-                                            microsoftStatus =
-                                                tr("Не удалось открыть браузер: {0}", e.message)
-                                        }
-                                    }
-                                ) {
-                                    Text(tr("Открыть страницу Microsoft"))
-                                }
-                            }
-                        }
-
-                        Spacer(Modifier.height(8.dp))
-
-                        Button(
-                            enabled = !microsoftBusy,
-                            onClick = {
-                                scope.launch {
-                                    microsoftBusy = true
-                                    microsoftStatus = tr("Запрашиваем код Microsoft…")
-                                    microsoftCode = ""
-                                    microsoftVerificationUrl = ""
-
-                                    try {
-                                        val deviceCode = MicrosoftAuth.requestDeviceCode()
-
-                                        microsoftCode = deviceCode.userCode
-                                        microsoftVerificationUrl = deviceCode.verificationUri
-                                        microsoftStatus = deviceCode.message
-
-                                        try {
-                                            if (Desktop.isDesktopSupported()) {
-                                                Desktop.getDesktop().browse(
-                                                    URI(deviceCode.verificationUri)
-                                                )
-                                            }
-                                        } catch (_: Exception) {
-                                            // Код и ссылка останутся видимыми в интерфейсе.
-                                        }
-
-                                        microsoftStatus = tr("Ожидаем подтверждения в браузере…")
-
-                                        val token = MicrosoftAuth.pollForToken(deviceCode) {
-                                            // Статус ожидания уже отображается в интерфейсе.
-                                        }
-
-                                        // Пока токен не сохраняем на диск.
-                                        microsoftStatus =
-                                            tr("Microsoft OAuth завершён. Xbox/Minecraft-авторизация ещё не выполнена.")
-
-                                        // Не выводим и не записываем access token в логи.
-                                        check(token.accessToken.isNotBlank()) {
-                                            tr("Microsoft не вернул access token.")
-                                        }
-                                    } catch (e: Exception) {
-                                        microsoftStatus =
-                                            tr("Ошибка входа: {0}", e.message ?: tr("неизвестная ошибка"))
-                                    } finally {
-                                        microsoftBusy = false
-                                    }
-                                }
-                            }
-                        ) {
-                            if (microsoftBusy) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    strokeWidth = 2.dp
-                                )
-                                Spacer(Modifier.width(8.dp))
-                            }
-
-                            Text(
-                                if (microsoftBusy) tr("Ожидание входа…") else tr("Войти через Microsoft")
-                            )
-                        }
-
-
-                        Spacer(Modifier.height(20.dp))
 
                         }
 
@@ -2492,6 +2424,41 @@ fun App() {
 
                         }
 
+                        if (settingsTab == "about") {
+                            Text("Material Client", fontSize = 18.sp, color = TextMain, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(6.dp))
+                            Text(tr("Версия {0}", AppInfo.VERSION), color = TextMuted)
+                            Spacer(Modifier.height(20.dp))
+                            Text(tr("Обновления"), color = TextMain, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(8.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Checkbox(
+                                    checked = autoUpdateCheck,
+                                    onCheckedChange = {
+                                        autoUpdateCheck = it
+                                        try { GameSettings.saveAutoUpdateCheck(it) } catch (_: Exception) { }
+                                    }
+                                )
+                                Text(tr("Проверять обновления при запуске"), color = TextMain, fontSize = 13.sp)
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Spacer(Modifier.height(8.dp))
+                            Button(
+                                onClick = { scope.launch { checkUpdates(manual = true) } },
+                                enabled = !updateChecking
+                            ) {
+                                Text(if (updateChecking) tr("Проверяем…") else tr("Проверить обновления"))
+                            }
+                            if (updateStatus.isNotBlank()) {
+                                Spacer(Modifier.height(8.dp))
+                                Text(
+                                    updateStatus,
+                                    color = if (I18n.isProblem(updateStatus)) MaterialTheme.colorScheme.error else TextMuted,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+
                         if (settingsTab == "network") {
                         Text(
                             tr("Сеть"),
@@ -2585,14 +2552,133 @@ fun App() {
 
 
                 if (currentPage == "Экземпляры") {
+                    val startGame: (Instance?) -> Unit = startGame@{ profileArg ->
+                        if (installing || gameRunning) return@startGame
+                                        val profile = profileArg
+
+                                        if (profile == null) {
+                                            gameStatus = tr("Сначала выбери профиль")
+                                        } else {
+                                            val username = offlineUsername.trim()
+                                            val usernameProblem =
+                                                OfflineAccountPreferences.validateUsername(username)
+
+                                            if (usernameProblem != null) {
+                                                gameStatus = usernameProblem
+                                            } else {
+                                                gameRunning = true
+                                                gameStatus = tr("Запускаем Minecraft…")
+
+                                                val startedAt = System.currentTimeMillis()
+                                                scope.launch {
+                                                    try {
+                                                        val result = withContext(
+                                                            kotlinx.coroutines.Dispatchers.IO
+                                                        ) {
+                                                            OfflineAccountPreferences.saveUsername(username)
+
+                                                            // Проверка файлов, выбор версии (для Forge это установленный
+                                                            // профиль Forge) и запуск выполняются вне UI-потока.
+                                                            MinecraftLauncher.launchProfile(
+                                                                baseVersion = profile.version,
+                                                                loader = profile.loader,
+                                                                profileName = profile.name,
+                                                                username = username,
+                                                                javaPath = javaPath.trim(),
+                                                                memoryMb = profile.memoryMb,
+                                                                extraJvmArgs = profile.jvmArgs,
+                                                                // Скачивание Java перед запуском: показываем, что происходит.
+                                                                onStatus = { message -> gameStatus = message }
+                                                            )
+                                                        }
+
+                                                        gameStatus = result.message
+
+                                                        val process = result.process
+                                                        if (result.success && process == null) {
+                                                            gameStatus = tr("Процесс Minecraft не создан")
+                                                        } else if (process != null) {
+                                                            val exitCode = withContext(
+                                                                kotlinx.coroutines.Dispatchers.IO
+                                                            ) {
+                                                                process.waitFor()
+                                                            }
+
+                                                            // После падения ищем в журналах понятную причину.
+                                                            val crashHint = if (exitCode == 0) null else withContext(
+                                                                kotlinx.coroutines.Dispatchers.IO
+                                                            ) {
+                                                                try {
+                                                                    GameLogs.load(profile.name, GameLogs.LAUNCH).hints.firstOrNull()
+                                                                        ?: GameLogs.load(profile.name, GameLogs.CRASH)
+                                                                            .takeIf { (it.file?.lastModified() ?: 0L) >= startedAt - 5_000 }
+                                                                            ?.hints?.firstOrNull()
+                                                                } catch (_: Exception) {
+                                                                    null
+                                                                }
+                                                            }
+                                                            if (exitCode != 0) logInstance = profile.name
+
+                                                            gameStatus = if (exitCode == 0) {
+                                                                tr("Minecraft завершил работу (код 0)")
+                                                            } else {
+                                                                tr("Ошибка: Minecraft завершился с кодом {0}. ", exitCode) +
+                                                                    (crashHint?.let { "$it " } ?: "") +
+                                                                    tr("Подробности: страница «Журнал игры».")
+                                                            }
+                                                        }
+                                                    } catch (e: Exception) {
+                                                        gameStatus =
+                                                            tr("Ошибка запуска: {0}", e.message ?: tr("неизвестная ошибка"))
+                                                    } finally {
+                                                        gameRunning = false
+                                                    }
+                                                }
+                                            }
+                                        }
+                    }
+                    val shownProfiles = if (instanceQuery.isBlank()) profiles else profiles.filter {
+                        it.name.contains(instanceQuery.trim(), ignoreCase = true) ||
+                            it.version.contains(instanceQuery.trim(), ignoreCase = true) ||
+                            it.loader.contains(instanceQuery.trim(), ignoreCase = true)
+                    }
+                    if (shownProfiles.isEmpty()) {
+                        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    if (profiles.isEmpty()) tr("Пока нет экземпляров") else tr("Ничего не найдено"),
+                                    color = TextMain,
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    if (profiles.isEmpty()) tr("Создай первый экземпляр, чтобы начать играть.") else tr("Попробуй изменить запрос."),
+                                    color = TextMuted
+                                )
+                                if (profiles.isEmpty()) {
+                                    Spacer(Modifier.height(16.dp))
+                                    Button(onClick = {
+                                        newName = "Minecraft $newVersion"
+                                        createError = null
+                                        showCreateDialog = true
+                                    }) {
+                                        Icon(Icons.Default.Add, contentDescription = null)
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(tr("Создать экземпляр"))
+                                    }
+                                }
+                            }
+                        }
+                    }
                     LazyVerticalGrid(
                         columns = GridCells.Adaptive(minSize = 132.dp * cardScale),
-                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        modifier = if (shownProfiles.isEmpty()) Modifier.fillMaxWidth() else Modifier.weight(1f).fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         contentPadding = PaddingValues(bottom = 8.dp)
                     ) {
-                        gridItems(profiles, key = { it.name }) { profile ->
+                        gridItems(shownProfiles, key = { it.name }) { profile ->
                             val selected = profile.name == selectedName
                             Box {
                             Surface(
@@ -2614,7 +2700,15 @@ fun App() {
                                             }
                                         }
                                     }
-                                    .clickable { selectedName = profile.name }
+                                    .pointerInput(profile.name) {
+                                        detectTapGestures(
+                                            onPress = { selectedName = profile.name },
+                                            onDoubleTap = {
+                                                selectedName = profile.name
+                                                startGame(profile)
+                                            }
+                                        )
+                                    }
                             ) {
                                 Column(
                                     Modifier.fillMaxSize().padding(12.dp),
@@ -2829,7 +2923,8 @@ fun App() {
                                     }
                                 },
                                 modifier = Modifier.fillMaxWidth(),
-                                colors = if (installing) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error) else ButtonDefaults.buttonColors()
+                                colors = if (installing) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                                else ButtonDefaults.buttonColors(containerColor = SurfaceB, contentColor = TextMain)
                             ) {
                                 if (installing) {
                                     Icon(Icons.Default.Close, contentDescription = null)
@@ -2921,97 +3016,16 @@ fun App() {
                                     Button(
                                     enabled = !installing && !gameRunning && selectedProfile != null,
                                     onClick = {
-                                        val profile = selectedProfile
-
-                                        if (profile == null) {
-                                            gameStatus = tr("Сначала выбери профиль")
-                                        } else {
-                                            val username = offlineUsername.trim()
-                                            val usernameProblem =
-                                                OfflineAccountPreferences.validateUsername(username)
-
-                                            if (usernameProblem != null) {
-                                                gameStatus = usernameProblem
-                                            } else {
-                                                gameRunning = true
-                                                gameStatus = tr("Запускаем Minecraft…")
-
-                                                val startedAt = System.currentTimeMillis()
-                                                scope.launch {
-                                                    try {
-                                                        val result = withContext(
-                                                            kotlinx.coroutines.Dispatchers.IO
-                                                        ) {
-                                                            OfflineAccountPreferences.saveUsername(username)
-
-                                                            // Проверка файлов, выбор версии (для Forge это установленный
-                                                            // профиль Forge) и запуск выполняются вне UI-потока.
-                                                            MinecraftLauncher.launchProfile(
-                                                                baseVersion = profile.version,
-                                                                loader = profile.loader,
-                                                                profileName = profile.name,
-                                                                username = username,
-                                                                javaPath = javaPath.trim(),
-                                                                memoryMb = profile.memoryMb,
-                                                                extraJvmArgs = profile.jvmArgs,
-                                                                // Скачивание Java перед запуском: показываем, что происходит.
-                                                                onStatus = { message -> gameStatus = message }
-                                                            )
-                                                        }
-
-                                                        gameStatus = result.message
-
-                                                        val process = result.process
-                                                        if (result.success && process == null) {
-                                                            gameStatus = tr("Процесс Minecraft не создан")
-                                                        } else if (process != null) {
-                                                            val exitCode = withContext(
-                                                                kotlinx.coroutines.Dispatchers.IO
-                                                            ) {
-                                                                process.waitFor()
-                                                            }
-
-                                                            // После падения ищем в журналах понятную причину.
-                                                            val crashHint = if (exitCode == 0) null else withContext(
-                                                                kotlinx.coroutines.Dispatchers.IO
-                                                            ) {
-                                                                try {
-                                                                    GameLogs.load(profile.name, GameLogs.LAUNCH).hints.firstOrNull()
-                                                                        ?: GameLogs.load(profile.name, GameLogs.CRASH)
-                                                                            .takeIf { (it.file?.lastModified() ?: 0L) >= startedAt - 5_000 }
-                                                                            ?.hints?.firstOrNull()
-                                                                } catch (_: Exception) {
-                                                                    null
-                                                                }
-                                                            }
-                                                            if (exitCode != 0) logInstance = profile.name
-
-                                                            gameStatus = if (exitCode == 0) {
-                                                                tr("Minecraft завершил работу (код 0)")
-                                                            } else {
-                                                                tr("Ошибка: Minecraft завершился с кодом {0}. ", exitCode) +
-                                                                    (crashHint?.let { "$it " } ?: "") +
-                                                                    tr("Подробности: страница «Журнал игры».")
-                                                            }
-                                                        }
-                                                    } catch (e: Exception) {
-                                                        gameStatus =
-                                                            tr("Ошибка запуска: {0}", e.message ?: tr("неизвестная ошибка"))
-                                                    } finally {
-                                                        gameRunning = false
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        startGame(selectedProfile)
                                     },
-                                    modifier = Modifier.weight(1f)
+                                    modifier = Modifier.weight(1f).height(48.dp)
                                 ) {
                                     Icon(
-                                        Icons.Default.Computer,
+                                        Icons.Default.PlayArrow,
                                         contentDescription = null
                                     )
                                     Spacer(Modifier.width(8.dp))
-                                    Text(if (gameRunning) tr("Minecraft запущен…") else tr("Играть"), maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
+                                    Text(if (gameRunning) tr("Minecraft запущен…") else tr("Играть"), maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 15.sp, fontWeight = FontWeight.Bold)
                                     }
                                 }
 
@@ -3146,6 +3160,7 @@ fun App() {
                                             ProfileStore.save(profiles)
                                             if (selectedName == target.name) selectedName = profiles.firstOrNull()?.name.orEmpty()
                                             if (modTargetInstance == target.name) modTargetInstance = profiles.firstOrNull()?.name.orEmpty()
+                                            if (logInstance == target.name) logInstance = profiles.firstOrNull()?.name.orEmpty()
                                         }
                                         deleteTarget = null
                                     }) { Text(tr("Удалить")) }
@@ -3312,7 +3327,10 @@ fun App() {
 
                                             if (version.isEmpty()) {
                                                 createError = tr("Выбери версию Minecraft")
-                                            } else if (profiles.any { it.name.equals(name, ignoreCase = true) }) {
+                                            } else if (profiles.any {
+                                                    it.name.equals(name, ignoreCase = true) ||
+                                                        LauncherPaths.instanceDirName(it.name).equals(LauncherPaths.instanceDirName(name), ignoreCase = true)
+                                                }) {
                                                 createError = tr("Экземпляр с таким названием уже существует")
                                             } else {
                                                 val savedLoader = if (installOptiFine) "OptiFine" else newLoader
@@ -3320,6 +3338,7 @@ fun App() {
                                                 profiles = profiles + created
                                                 selectedName = created.name
                                                 if (modTargetInstance.isBlank()) modTargetInstance = created.name
+                                                if (logInstance.isBlank()) logInstance = created.name
                                                 ProfileStore.save(profiles)
                                                 status = tr("Профиль сохранён")
                                                 newName = ""

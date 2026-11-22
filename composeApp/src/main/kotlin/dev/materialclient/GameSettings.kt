@@ -54,6 +54,18 @@ internal object GameSettings {
         get() = I18n.normalize(read().getProperty("language"))
 
     fun saveLanguage(code: String) = write("language", I18n.normalize(code))
+
+    /** Репозиторий GitHub «владелец/имя», где лежат релизы лаунчера. Пусто — обновления не проверяются. */
+    val updateRepo: String
+        get() = read().getProperty("updateRepo", "").trim()
+
+    fun saveUpdateRepo(value: String) = write("updateRepo", value.trim())
+
+    /** Проверять обновления при запуске. По умолчанию включено. */
+    val autoUpdateCheck: Boolean
+        get() = read().getProperty("autoUpdateCheck", "true") != "false"
+
+    fun saveAutoUpdateCheck(value: Boolean) = write("autoUpdateCheck", value.toString())
 }
 
 /** Разбор и проверка строки JVM-аргументов. */

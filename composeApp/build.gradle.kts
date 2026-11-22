@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "dev.materialclient"
-version = "0.3.0"
+version = "0.3.1"
 
 dependencies {
     implementation(compose.desktop.currentOs)
@@ -36,7 +36,7 @@ compose.desktop {
             )
             packageName = "Material Client"
             // Формат x.y.z обязателен для установщика Windows. Бета-метка добавляется в имя файла при выкладке.
-            packageVersion = "0.3.0"
+            packageVersion = "0.3.1"
             description = "Material Client — Minecraft launcher"
             vendor = "Material Client"
             // Нужны, чтобы лаунчер узнавал объём оперативной памяти для автоподбора -Xmx.
