@@ -55,6 +55,12 @@ internal object GameSettings {
 
     fun saveLanguage(code: String) = write("language", I18n.normalize(code))
 
+    /** Порядок экземпляров в библиотеке: added, recent, name или version. */
+    val instanceSort: String
+        get() = read().getProperty("instanceSort", "added")
+
+    fun saveInstanceSort(mode: String) = write("instanceSort", mode)
+
     /** Репозиторий GitHub «владелец/имя», где лежат релизы лаунчера. Пусто — обновления не проверяются. */
     val updateRepo: String
         get() = read().getProperty("updateRepo", "").trim()

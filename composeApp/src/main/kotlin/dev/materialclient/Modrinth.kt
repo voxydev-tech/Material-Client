@@ -4,6 +4,7 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -27,6 +28,13 @@ internal object ModLoaders {
     }
 }
 
+/** Что можно ставить из Modrinth: моды, ресурспаки и шейдеры (у каждого своя папка в экземпляре). */
+internal enum class ContentKind(val projectType: String, val folder: String, val extensions: List<String>) {
+    MOD("mod", "mods", listOf(".jar")),
+    RESOURCEPACK("resourcepack", "resourcepacks", listOf(".zip")),
+    SHADER("shader", "shaderpacks", listOf(".zip"))
+}
+
 /** Итог установки мода: сам файл, поставленные зависимости и те, что поставить не удалось. */
 internal class ModInstallReport(
     val fileName: String,
@@ -41,6 +49,35 @@ internal class ModInstallReport(
             }
             val base = tr("Установлен {0} в {1}", fileName, dir.absolutePath)
             return if (dependencies.isEmpty()) base else base + " " + tr("Зависимости установлены: {0}.", dependencies.joinToString(", "))
+        }
+}
+
+/** Найденное обновление одного мода. */
+internal class ModUpdate(
+    /** Текущий файл в папке mods (у выключенного мода оканчивается на .disabled). */
+    val fileName: String,
+    val enabled: Boolean,
+    val projectId: String,
+    val title: String,
+    val currentVersion: String,
+    val newVersionId: String,
+    val newVersion: String
+)
+
+/** Итог проверки: что можно обновить, сколько модов проверено и сколько Modrinth не знает. */
+internal class ModUpdateCheck(
+    val updates: List<ModUpdate>,
+    val total: Int,
+    val unknown: Int,
+    val installedProjects: Set<String>
+)
+
+internal class ModUpdateReport(val updated: List<String>, val failed: List<String>, val dependencies: List<String>) {
+    val message: String
+        get() {
+            val base = if (updated.isEmpty()) tr("Ни один мод не обновлён.") else tr("Обновлено модов: {0} ({1}).", updated.size, updated.joinToString(", "))
+            val deps = if (dependencies.isEmpty()) "" else " " + tr("Добавлены зависимости: {0}.", dependencies.joinToString(", "))
+            return if (failed.isEmpty()) base + deps else tr("Ошибка: часть модов не обновлена: {0}.", failed.joinToString("; ")) + " " + base + deps
         }
 }
 
@@ -66,8 +103,8 @@ object ModrinthApi {
      * Адрес поиска. Если известны версия игры и загрузчик, Modrinth сам оставляет только подходящие моды
      * (для Quilt показываются и моды Fabric).
      */
-    internal fun searchUrl(query: String, mcVersion: String? = null, loader: String? = null): String {
-        val facets = mutableListOf(listOf("project_type:mod"))
+    internal fun searchUrl(query: String, mcVersion: String? = null, loader: String? = null, projectType: String = "mod"): String {
+        val facets = mutableListOf(listOf("project_type:$projectType"))
         if (mcVersion != null && safeFacetValue.matches(mcVersion)) facets += listOf("versions:$mcVersion")
         val loaders = ModLoaders.compatible(loader)
         if (loaders.isNotEmpty()) facets += loaders.map { "categories:$it" }
@@ -79,9 +116,9 @@ object ModrinthApi {
         return "$apiBase/search?facets=${enc(facetsJson)}$queryPart$sortPart&limit=24"
     }
 
-    suspend fun search(query: String, mcVersion: String? = null, loader: String? = null): List<ModrinthMod> =
+    suspend fun search(query: String, mcVersion: String? = null, loader: String? = null, projectType: String = "mod"): List<ModrinthMod> =
         withContext(Dispatchers.IO) {
-            val json = JsonParser.parseString(Net.getText(searchUrl(query, mcVersion, loader))).asJsonObject
+            val json = JsonParser.parseString(Net.getText(searchUrl(query, mcVersion, loader, projectType))).asJsonObject
             json.getAsJsonArray("hits").map { element ->
                 val item = element.asJsonObject
                 ModrinthMod(
@@ -158,7 +195,9 @@ object ModrinthApi {
         val loaders: List<String>,
         val modsDir: File,
         val index: Index,
-        val onStatus: (String) -> Unit
+        val onStatus: (String) -> Unit,
+        /** Проекты Modrinth, которые уже стоят в экземпляре (в том числе поставленные вручную). */
+        val known: Set<String> = emptySet()
     ) {
         val visited = mutableSetOf<String>()
         val installedDeps = mutableListOf<String>()
@@ -174,9 +213,13 @@ object ModrinthApi {
     }
 
     /** Скачивает файл версии в папку mods и возвращает его имя. */
-    private fun download(ctx: Context, file: JsonObject, title: String): String {
+    private fun download(ctx: Context, file: JsonObject, title: String, extensions: List<String> = listOf(".jar")): String {
         val fileName = str(file, "filename") ?: error(tr("У мода нет доступных файлов"))
-        require(fileName.endsWith(".jar", ignoreCase = true)) { tr("Файл мода не является JAR: {0}", fileName) }
+        if (extensions == listOf(".jar")) {
+            require(fileName.endsWith(".jar", ignoreCase = true)) { tr("Файл мода не является JAR: {0}", fileName) }
+        } else {
+            require(extensions.any { fileName.endsWith(it, ignoreCase = true) }) { tr("Файл не подходит по типу ({0}): {1}", extensions.joinToString(", "), fileName) }
+        }
         val target = File(ctx.modsDir, fileName).canonicalFile
         check(target.parentFile == ctx.modsDir.canonicalFile) { tr("Некорректное имя файла мода") }
         ctx.onStatus(tr("Скачиваем {0}…", title))
@@ -200,7 +243,7 @@ object ModrinthApi {
     private fun alreadyInstalled(ctx: Context, projectId: String, fileName: String?): Boolean {
         val recorded = ctx.index.fileOf(projectId)
         fun present(name: String) = File(ctx.modsDir, name).isFile || File(ctx.modsDir, "$name.disabled").isFile
-        return (recorded != null && present(recorded)) || (fileName != null && present(fileName))
+        return projectId in ctx.known || (recorded != null && present(recorded)) || (fileName != null && present(fileName))
     }
 
     /** Ставит версию мода и, рекурсивно, его обязательные зависимости. Возвращает имя файла или null, если мод уже стоит. */
@@ -257,6 +300,151 @@ object ModrinthApi {
             ModInstallReport(fileName, modsDir, ctx.installedDeps.toList(), ctx.failedDeps.toList())
         }
 
+    /**
+     * Ставит ресурспак или шейдер последней подходящей версии для Minecraft экземпляра в его папку resourcepacks или shaderpacks.
+     * Загрузчик не важен: у таких файлов зависимостей нет. Для шейдеров в игре нужен мод Iris (Fabric/Quilt) или OptiFine.
+     */
+    internal suspend fun installContent(kind: ContentKind, projectId: String, profile: Instance, onStatus: (String) -> Unit = {}): String =
+        withContext(Dispatchers.IO) {
+            require(kind != ContentKind.MOD) { tr("Некорректный ID проекта Modrinth") }
+            require(projectId.matches(Regex("[A-Za-z0-9_-]+"))) { tr("Некорректный ID проекта Modrinth") }
+            val path = "/project/$projectId/version?game_versions=${enc("[\"${profile.version}\"]")}"
+            val version = pickVersion(getJson(path).asJsonArray) ?: error(tr("Нет версии для Minecraft {0}", profile.version))
+            val dir = File(LauncherPaths.instanceDir(profile.name), kind.folder).apply { mkdirs() }
+            val ctx = Context(profile.version, emptyList(), dir, Index(File(dir, ".modrinth-unused")), onStatus)
+            val name = download(ctx, primaryFile(version), str(version, "name") ?: projectId, kind.extensions)
+            tr("Установлен {0} в {1}", name, dir.absolutePath)
+        }
+
     suspend fun installLatestCompatible(projectId: String, profile: Instance, onStatus: (String) -> Unit = {}): String =
         install(projectId, profile, onStatus).message
+
+    // ---------------------------------------------------------------- обновление установленных модов
+
+    private fun isModFile(name: String) = name.endsWith(".jar", true) || name.endsWith(".jar.disabled", true)
+
+    private fun requireModLoader(profile: Instance): List<String> {
+        val loaders = ModLoaders.compatible(profile.loader)
+        require(loaders.isNotEmpty()) {
+            tr("Экземпляр {0} использует {1}: моды работают только с Fabric, Forge, NeoForge или Quilt. Создай экземпляр с загрузчиком модов.", profile.name, profile.loader)
+        }
+        return loaders
+    }
+
+    private fun stringArray(values: Collection<String>) = JsonArray().also { array -> values.forEach { array.add(it) } }
+
+    /**
+     * Ищет обновления для всех модов экземпляра по контрольной сумме файлов: так находятся и моды, которые ставили вручную.
+     * Версия обновляется только до подходящей версии Minecraft и загрузчика. Бета не заменяет релиз.
+     */
+    internal suspend fun checkUpdates(profile: Instance, onStatus: (String) -> Unit = {}): ModUpdateCheck =
+        withContext(Dispatchers.IO) {
+            val loaders = requireModLoader(profile)
+            val files = InstalledMods.dir(profile.name).listFiles().orEmpty().filter { it.isFile && isModFile(it.name) }
+            if (files.isEmpty()) return@withContext ModUpdateCheck(emptyList(), 0, 0, emptySet())
+            onStatus(tr("Проверяем обновления модов…"))
+            val byHash = LinkedHashMap<String, File>()
+            for (file in files) byHash[sha1(file)] = file
+
+            val current = JsonParser.parseString(
+                Net.postJson("$apiBase/version_files", JsonObject().apply {
+                    add("hashes", stringArray(byHash.keys))
+                    addProperty("algorithm", "sha1")
+                }.toString())
+            ).asJsonObject
+            val newest = JsonParser.parseString(
+                Net.postJson("$apiBase/version_files/update", JsonObject().apply {
+                    add("hashes", stringArray(byHash.keys))
+                    addProperty("algorithm", "sha1")
+                    add("loaders", stringArray(loaders))
+                    add("game_versions", stringArray(listOf(profile.version)))
+                }.toString())
+            ).asJsonObject
+
+            val installedProjects = mutableSetOf<String>()
+            val found = mutableListOf<Triple<File, JsonObject, JsonObject>>()
+            var unknown = 0
+            for ((hash, file) in byHash) {
+                val now = current.get(hash)?.takeUnless { it.isJsonNull }?.asJsonObject
+                if (now == null) {
+                    unknown++
+                    continue
+                }
+                str(now, "project_id")?.let { installedProjects += it }
+                val next = newest.get(hash)?.takeUnless { it.isJsonNull }?.asJsonObject ?: continue
+                if (str(next, "id") == str(now, "id")) continue
+                // Даты в формате ISO сравниваются как строки; более старую версию не предлагаем.
+                if ((str(next, "date_published") ?: "") <= (str(now, "date_published") ?: "")) continue
+                // Бета и альфа не заменяют релиз.
+                if (str(next, "version_type") != "release" && str(now, "version_type") == "release") continue
+                found += Triple(file, now, next)
+            }
+
+            val titles = try {
+                val ids = found.mapNotNull { str(it.second, "project_id") }.distinct()
+                if (ids.isEmpty()) emptyMap() else {
+                    val list = getJson("/projects?ids=${enc(stringArray(ids).toString())}").asJsonArray
+                    list.associate { it.asJsonObject.get("id").asString to (str(it.asJsonObject, "title") ?: "") }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyMap()
+            }
+
+            val updates = found.map { (file, now, next) ->
+                val projectId = str(now, "project_id") ?: ""
+                val enabled = !file.name.endsWith(".disabled", true)
+                ModUpdate(
+                    fileName = file.name,
+                    enabled = enabled,
+                    projectId = projectId,
+                    title = titles[projectId]?.takeIf { it.isNotBlank() } ?: file.name.removeSuffix(".disabled").removeSuffix(".jar"),
+                    currentVersion = str(now, "version_number") ?: str(now, "name") ?: "?",
+                    newVersionId = str(next, "id") ?: "",
+                    newVersion = str(next, "version_number") ?: str(next, "name") ?: "?"
+                )
+            }.filter { it.projectId.isNotEmpty() && it.newVersionId.isNotEmpty() }
+                .sortedBy { it.title.lowercase() }
+            ModUpdateCheck(updates, byHash.size, unknown, installedProjects)
+        }
+
+    /**
+     * Обновляет найденные моды: скачивает новую версию с проверкой SHA-1, убирает старый файл и ставит недостающие
+     * обязательные зависимости. Выключенный мод остаётся выключенным. Ошибка одного мода не мешает остальным.
+     */
+    internal suspend fun updateMods(profile: Instance, check: ModUpdateCheck, onStatus: (String) -> Unit = {}): ModUpdateReport =
+        withContext(Dispatchers.IO) {
+            val loaders = requireModLoader(profile)
+            val instanceDir = LauncherPaths.instanceDir(profile.name)
+            val modsDir = File(instanceDir, "mods").apply { mkdirs() }
+            val ctx = Context(profile.version, loaders, modsDir, Index(File(instanceDir, "modrinth-mods.json")), onStatus, check.installedProjects)
+            val updated = mutableListOf<String>()
+            val failed = mutableListOf<String>()
+            for (update in check.updates) {
+                try {
+                    require(update.fileName.none { it == '/' || it == '\\' } && isModFile(update.fileName)) { tr("Недопустимое имя файла.") }
+                    require(update.projectId.matches(Regex("[A-Za-z0-9_-]+")) && update.newVersionId.matches(Regex("[A-Za-z0-9_-]+"))) {
+                        tr("Некорректный ID проекта Modrinth")
+                    }
+                    ctx.visited.clear()
+                    val newName = installOne(ctx, update.projectId, update.newVersionId, isMain = true, depth = 0)
+                        ?: error(tr("У мода нет доступных файлов"))
+                    val oldFile = File(modsDir, update.fileName)
+                    if (update.enabled) {
+                        if (newName != update.fileName) Files.deleteIfExists(oldFile.toPath())
+                    } else {
+                        // Выключенный мод остаётся выключенным: новый файл получает суффикс .disabled.
+                        Files.deleteIfExists(oldFile.toPath())
+                        Files.move(File(modsDir, newName).toPath(), File(modsDir, "$newName.disabled").toPath(), StandardCopyOption.REPLACE_EXISTING)
+                    }
+                    updated += "${update.title} ${update.currentVersion} → ${update.newVersion}"
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    failed += "${update.title} (${e.message ?: e.javaClass.simpleName})"
+                }
+            }
+            ModUpdateReport(updated, failed + ctx.failedDeps, ctx.installedDeps.toList())
+        }
 }

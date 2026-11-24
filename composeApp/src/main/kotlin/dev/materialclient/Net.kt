@@ -153,6 +153,36 @@ internal object Net {
         }
     }
 
+    /** POST с JSON-телом (пакетные запросы Modrinth). Один повтор при сетевой ошибке. */
+    fun postJson(url: String, body: String): String {
+        var last: Exception? = null
+        for (attempt in 0..1) {
+            val connection = open(url, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS)
+            try {
+                connection.requestMethod = "POST"
+                connection.doOutput = true
+                connection.setRequestProperty("Content-Type", "application/json")
+                connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                val code = connection.responseCode
+                if (code !in 200..299) throw HttpStatusException(code, url)
+                return connection.inputStream.bufferedReader().use { it.readText() }
+            } catch (e: HttpStatusException) {
+                throw e
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                last = e
+                if (!isNetworkError(e)) break
+            } finally {
+                connection.disconnect()
+            }
+            if (attempt == 0) Thread.sleep(700)
+        }
+        val error = last ?: IllegalStateException()
+        val hint = if (isNetworkError(error)) " $HINT" else ""
+        throw IllegalStateException(tr("Не удалось получить данные ({0}).{1}", "${hostOf(url)}: ${describe(error)}", hint), error)
+    }
+
     /** Один из возможных адресов данных вместе с тем, как их разобрать. */
     class Source<T>(val url: String, val mirror: Boolean = false, val parse: (String) -> T)
 

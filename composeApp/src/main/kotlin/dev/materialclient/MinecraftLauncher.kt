@@ -429,7 +429,6 @@ object MinecraftLauncher {
                 javaPath, resolved.javaMajor, JavaProvider.maxMajorFor(loader, resolved.javaMajor), onStatus = onStatus
             )
             val java = selection.java
-            val javaNote = selection.note
 
             val libraryFiles = VersionResolver.classpathLibraries(resolved)
             val missing = libraryFiles.firstOrNull { !it.isFile }
@@ -523,7 +522,7 @@ object MinecraftLauncher {
 
             MinecraftLaunchResult(
                 success = true,
-                message = tr("Minecraft запущен") + (if (javaNote != null) " ($javaNote)" else ""),
+                message = tr("Minecraft запущен"),
                 process = process,
                 logFile = logFile
             )

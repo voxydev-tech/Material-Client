@@ -7,7 +7,7 @@ import java.io.File
 
 /** Версия этого лаунчера. Меняй её вместе с `version` и `packageVersion` в composeApp/build.gradle.kts. */
 internal object AppInfo {
-    const val VERSION = "0.3.1"
+    const val VERSION = "1.0.0"
 
     /** Репозиторий релизов по умолчанию («владелец/имя»). Пользователь может задать свой в «О лаунчере». */
     const val DEFAULT_REPO = "voxydev-tech/Material-Client"

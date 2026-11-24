@@ -120,7 +120,15 @@ data class Instance(
     /** Память игры, МБ. 0 — как в общих настройках. */
     val memoryMb: Int = 0,
     /** Дополнительные JVM-аргументы этого экземпляра. */
-    val jvmArgs: String = ""
+    val jvmArgs: String = "",
+    /** Когда экземпляр запускали последний раз (мс с 1970 года). 0 — ещё не запускали. */
+    val lastPlayed: Long = 0L,
+    /** Значок экземпляра: ключ из InstanceIcons или "image" (своя картинка icon.png в папке экземпляра). Пусто — по загрузчику. */
+    val icon: String = "",
+    /** Цвет значка в виде #RRGGBB; пусто — цвет интерфейса. */
+    val iconColor: String = "",
+    /** Сколько секунд наиграно в этом экземпляре. */
+    val playTimeSec: Long = 0L
 )
 
 private object ProfileStore {
@@ -145,7 +153,13 @@ private object ProfileStore {
                 val version = p.getProperty("profile.$i.version") ?: return@mapNotNull null
                 val loader = p.getProperty("profile.$i.loader", "Vanilla")
                 val memory = p.getProperty("profile.$i.memory", "0").trim().toIntOrNull()?.coerceAtLeast(0) ?: 0
-                Instance(name, version, loader, memory, p.getProperty("profile.$i.jvmArgs", ""))
+                val lastPlayed = p.getProperty("profile.$i.lastPlayed", "0").trim().toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+                Instance(
+                    name, version, loader, memory, p.getProperty("profile.$i.jvmArgs", ""), lastPlayed,
+                    icon = p.getProperty("profile.$i.icon", ""),
+                    iconColor = p.getProperty("profile.$i.iconColor", ""),
+                    playTimeSec = p.getProperty("profile.$i.playTime", "0").trim().toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+                )
             }
         } catch (_: Exception) {
             listOf(Instance("Vanilla Survival", "1.21.1"))
@@ -163,6 +177,10 @@ private object ProfileStore {
                 p.setProperty("profile.$i.loader", instance.loader)
                 p.setProperty("profile.$i.memory", instance.memoryMb.toString())
                 p.setProperty("profile.$i.jvmArgs", instance.jvmArgs)
+                p.setProperty("profile.$i.lastPlayed", instance.lastPlayed.toString())
+                p.setProperty("profile.$i.icon", instance.icon)
+                p.setProperty("profile.$i.iconColor", instance.iconColor)
+                p.setProperty("profile.$i.playTime", instance.playTimeSec.toString())
             }
             file.outputStream().use {
                 p.store(it, "Material Client profiles")
@@ -1003,6 +1021,9 @@ fun App() {
     // Язык интерфейса лежит в I18n (состояние Compose): любой tr() на экране перерисовывается при его смене.
     val uiLanguage = I18n.language
     var contextMenuProfile by remember { mutableStateOf<Instance?>(null) }
+    var iconTarget by remember { mutableStateOf<Instance?>(null) }
+    var worldsTarget by remember { mutableStateOf<Instance?>(null) }
+    var exportTarget by remember { mutableStateOf<Instance?>(null) }
     var deleteTarget by remember { mutableStateOf<Instance?>(null) }
     val savedTheme = remember { ThemePreferences.load() }
     var accentChoice by remember { mutableStateOf(savedTheme.getProperty("themeChoice", "Бирюзовый")) }
@@ -1010,6 +1031,23 @@ fun App() {
     var cardScale by remember { mutableFloatStateOf(savedTheme.getProperty("instanceCardScale", "1.0").toFloatOrNull()?.coerceIn(0.8f, 1.2f) ?: 1.0f) }
     var selectedFontPath by remember { mutableStateOf(savedTheme.getProperty("customFontPath", "")) }
     var fontStatus by remember { mutableStateOf("") }
+    // Основной шрифт лаунчера (Onest, лицензия OFL) лежит внутри приложения; свой шрифт из настроек главнее.
+    val bundledFontFamily = remember {
+        try {
+            // Читаем шрифты из ресурсов сами и отдаём Compose готовые байты: так не зависим от поиска ресурсов.
+            fun bundled(file: String, weight: FontWeight) = ComposePlatformFont(
+                identity = "Onest-$file",
+                data = checkNotNull(object {}.javaClass.getResourceAsStream("/fonts/Onest-$file.ttf")) { "font $file" }.use { it.readBytes() },
+                weight = weight
+            )
+            FontFamily(
+                bundled("Regular", FontWeight.Normal),
+                bundled("Medium", FontWeight.Medium),
+                bundled("SemiBold", FontWeight.SemiBold),
+                bundled("Bold", FontWeight.Bold)
+            )
+        } catch (_: Throwable) { FontFamily.SansSerif }
+    }
     val interfaceFontFamily = remember(selectedFontPath) {
         if (selectedFontPath.isNotBlank()) {
             try {
@@ -1017,9 +1055,9 @@ fun App() {
                 if (fontFile.isFile) FontFamily(
                     ComposePlatformFont(file = fontFile, weight = FontWeight.Normal),
                     ComposePlatformFont(file = fontFile, weight = FontWeight.Bold)
-                ) else FontFamily.SansSerif
-            } catch (_: Throwable) { FontFamily.SansSerif }
-        } else FontFamily.SansSerif
+                ) else bundledFontFamily
+            } catch (_: Throwable) { bundledFontFamily }
+        } else bundledFontFamily
     }
     fun saveFontPath(path: String) {
         selectedFontPath = path
@@ -1113,6 +1151,10 @@ fun App() {
     var gameRunning by remember {
         mutableStateOf(false)
     }
+    // Процесс запущенной игры (для кнопки «Закрыть Minecraft») и экземпляр, который сейчас играет.
+    var gameProcess by remember { mutableStateOf<Process?>(null) }
+    var runningInstance by remember { mutableStateOf("") }
+    var gameStopRequested by remember { mutableStateOf(false) }
     var javaPath by remember { mutableStateOf(JavaPreferences.loadJavaPath()) }
     var javaSettingsStatus by remember { mutableStateOf("") }
     var autoJava by remember { mutableStateOf(GameSettings.autoJava) }
@@ -1133,6 +1175,129 @@ fun App() {
     var logSourceLabel by remember { mutableStateOf("") }
     var logRefresh by remember { mutableStateOf(0) }
     var logView by remember { mutableStateOf<LogView?>(null) }
+
+    // Обновление модов и импорт сборок .mrpack.
+    var modUpdateCheck by remember { mutableStateOf<ModUpdateCheck?>(null) }
+    var modUpdateBusy by remember { mutableStateOf(false) }
+    var modUpdateStatus by remember { mutableStateOf("") }
+    var packImportBusy by remember { mutableStateOf(false) }
+    var packImportStatus by remember { mutableStateOf("") }
+    var instanceSort by remember { mutableStateOf(InstanceSort.normalize(GameSettings.instanceSort)) }
+    var sortMenuOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(modTargetInstance) {
+        modUpdateCheck = null
+        modUpdateStatus = ""
+    }
+
+    fun checkModUpdates() {
+        val target = profiles.firstOrNull { it.name == modTargetInstance } ?: return
+        if (modUpdateBusy) return
+        modUpdateBusy = true
+        modUpdateStatus = tr("Проверяем обновления модов…")
+        scope.launch {
+            try {
+                val result = ModrinthApi.checkUpdates(target) { modUpdateStatus = it }
+                modUpdateCheck = result
+                modUpdateStatus = when {
+                    result.total == 0 -> tr("В папке mods нет модов.")
+                    result.updates.isEmpty() -> tr("Все моды актуальны (проверено: {0}, не найдено на Modrinth: {1}).", result.total, result.unknown)
+                    else -> tr("Найдено обновлений: {0}.", result.updates.size)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                modUpdateStatus = tr("Не удалось проверить обновления модов: {0}", e.message ?: tr("ошибка"))
+            } finally {
+                modUpdateBusy = false
+            }
+        }
+    }
+
+    fun applyModUpdates() {
+        val target = profiles.firstOrNull { it.name == modTargetInstance } ?: return
+        val check = modUpdateCheck ?: return
+        if (modUpdateBusy) return
+        if (gameRunning) {
+            modUpdateStatus = tr("Закрой игру перед обновлением модов.")
+            return
+        }
+        modUpdateBusy = true
+        modUpdateStatus = tr("Обновляем моды…")
+        scope.launch {
+            try {
+                val report = ModrinthApi.updateMods(target, check) { modUpdateStatus = it }
+                modUpdateStatus = report.message
+                modUpdateCheck = null
+                installedModsRefresh += 1
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                modUpdateStatus = tr("Ошибка: не удалось обновить моды: {0}", e.message ?: tr("ошибка"))
+            } finally {
+                modUpdateBusy = false
+            }
+        }
+    }
+
+    fun importPack() {
+        if (packImportBusy || installing) return
+        val dialog = FileDialog(null as Frame?, tr("Выбери файл сборки (.mrpack)"), FileDialog.LOAD)
+        dialog.file = "*.mrpack"
+        dialog.isVisible = true
+        val chosen = dialog.file?.let { File(dialog.directory, it) } ?: return
+        packImportBusy = true
+        packImportStatus = tr("Читаем сборку…")
+        scope.launch {
+            try {
+                val index = withContext(kotlinx.coroutines.Dispatchers.IO) { MrPack.read(chosen) }
+                val name = MrPack.uniqueName(MrPack.suggestedName(index, tr("Сборка")), profiles.map { it.name })
+                val created = Instance(name, index.minecraft, index.loader)
+                profiles = profiles + created
+                selectedName = created.name
+                modTargetInstance = created.name
+                if (logInstance.isBlank()) logInstance = created.name
+                ProfileStore.save(profiles)
+                val report = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    MrPack.install(chosen, index, LauncherPaths.instanceDir(name), { packImportStatus = it })
+                }
+                packImportStatus = report.message + " " +
+                    tr("Экземпляр «{0}» создан: нажми «Установить / проверить файлы», чтобы поставить Minecraft {1} и загрузчик.", name, index.minecraft)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                packImportStatus = tr("Ошибка: не удалось импортировать сборку: {0}", e.message ?: tr("ошибка"))
+            } finally {
+                packImportBusy = false
+            }
+        }
+    }
+    fun duplicateInstance(source: Instance) {
+        if (packImportBusy || installing) return
+        if (gameRunning && runningInstance == source.name) {
+            packImportStatus = tr("Нельзя копировать экземпляр, пока он запущен.")
+            return
+        }
+        val name = MrPack.uniqueName(tr("{0} (копия)", source.name), profiles.map { it.name })
+        packImportBusy = true
+        packImportStatus = tr("Копируем экземпляр «{0}»…", source.name)
+        scope.launch {
+            try {
+                val created = withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    InstanceCopy.copy(source, name) { packImportStatus = tr("Копируем экземпляр «{0}»: файлов {1}…", source.name, it) }
+                }
+                profiles = profiles + created
+                selectedName = created.name
+                ProfileStore.save(profiles)
+                packImportStatus = tr("Экземпляр скопирован: «{0}».", created.name)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                packImportStatus = tr("Ошибка: не удалось скопировать экземпляр: {0}", e.message ?: tr("ошибка"))
+            } finally {
+                packImportBusy = false
+            }
+        }
+    }
     LaunchedEffect(currentPage, modTargetInstance, installedModsRefresh) {
         if (currentPage == "Установленные моды") {
             installedMods = withContext(kotlinx.coroutines.Dispatchers.IO) { InstalledMods.list(modTargetInstance) }
@@ -1536,6 +1701,7 @@ fun App() {
                     "Экземпляры" -> {
                         Spacer(Modifier.height(14.dp))
                         if (profiles.size > 1) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
                             OutlinedTextField(
                                 value = instanceQuery,
                                 onValueChange = { instanceQuery = it },
@@ -1549,24 +1715,89 @@ fun App() {
                                     }
                                 },
                                 singleLine = true,
-                                modifier = Modifier.fillMaxWidth()
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Box {
+                                OutlinedButton(onClick = { sortMenuOpen = true }) {
+                                    Icon(Icons.Default.Sort, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        tr("Сортировка: {0}", tr(
+                                            when (instanceSort) {
+                                                InstanceSort.RECENT -> "Недавно играл"
+                                                InstanceSort.NAME -> "По названию"
+                                                InstanceSort.VERSION -> "По версии Minecraft"
+                                                else -> "В порядке создания"
+                                            }
+                                        ))
+                                    )
+                                }
+                                DropdownMenu(expanded = sortMenuOpen, onDismissRequest = { sortMenuOpen = false }) {
+                                    for ((mode, label) in listOf(
+                                        InstanceSort.ADDED to "В порядке создания",
+                                        InstanceSort.RECENT to "Недавно играл",
+                                        InstanceSort.NAME to "По названию",
+                                        InstanceSort.VERSION to "По версии Minecraft"
+                                    )) {
+                                        DropdownMenuItem(
+                                            text = { Text(tr(label)) },
+                                            leadingIcon = {
+                                                if (instanceSort == mode) Icon(Icons.Default.Check, contentDescription = null)
+                                            },
+                                            onClick = {
+                                                instanceSort = mode
+                                                GameSettings.saveInstanceSort(mode)
+                                                sortMenuOpen = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                            }
+                        }
+                        if (packImportStatus.isNotBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                packImportStatus,
+                                color = if (I18n.isProblem(packImportStatus)) MaterialTheme.colorScheme.error else TextMuted,
+                                fontSize = 12.sp
                             )
                         }
                         Spacer(Modifier.height(14.dp))
                     }
 
                     "Каталог модов" -> {
+                        var catalogKind by remember { mutableStateOf(ContentKind.MOD) }
+                        var modInstallStatus by remember { mutableStateOf<String?>(null) }
                         Text(
-                            if (modQuery.isBlank()) tr("Популярные моды на Modrinth") else tr("Ищи моды и расширяй свою сборку"),
+                            when (catalogKind) {
+                                ContentKind.MOD -> if (modQuery.isBlank()) tr("Популярные моды на Modrinth") else tr("Ищи моды и расширяй свою сборку")
+                                ContentKind.RESOURCEPACK -> tr("Ресурспаки меняют текстуры и звуки игры")
+                                ContentKind.SHADER -> tr("Шейдеры улучшают освещение и картинку")
+                            },
                             color = TextMuted
                         )
 
-                        Spacer(Modifier.height(16.dp))
+                        Spacer(Modifier.height(10.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            for ((kind, label) in listOf(
+                                ContentKind.MOD to "Моды",
+                                ContentKind.RESOURCEPACK to "Ресурспаки",
+                                ContentKind.SHADER to "Шейдеры"
+                            )) {
+                                FilterChip(
+                                    selected = catalogKind == kind,
+                                    onClick = { if (catalogKind != kind) { catalogKind = kind; mods = emptyList(); modInstallStatus = null } },
+                                    label = { Text(tr(label)) }
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
 
                         // Каталог сам подбирает моды под версию Minecraft и загрузчик выбранного экземпляра.
                         val catalogTarget = profiles.firstOrNull { it.name == modTargetInstance }
                         var modLoaderFilter by remember { mutableStateOf(ModLoaders.canonical(catalogTarget?.loader) ?: "Все") }
-                        var modInstallStatus by remember { mutableStateOf<String?>(null) }
                         suspend fun loadMods() {
                             modsLoading = true
                             modsError = null
@@ -1574,7 +1805,8 @@ fun App() {
                                 mods = ModrinthApi.search(
                                     modQuery,
                                     catalogTarget?.version,
-                                    if (modLoaderFilter == "Все") null else modLoaderFilter
+                                    if (catalogKind != ContentKind.MOD || modLoaderFilter == "Все") null else modLoaderFilter,
+                                    catalogKind.projectType
                                 )
                             } catch (e: Exception) {
                                 modsError = e.message ?: tr("Не удалось загрузить моды")
@@ -1586,7 +1818,7 @@ fun App() {
                             ModLoaders.canonical(catalogTarget?.loader)?.let { modLoaderFilter = it }
                         }
                         // Поиск запускается сам через долю секунды после последнего символа (кнопка «Найти» остаётся).
-                        LaunchedEffect(modTargetInstance, catalogTarget?.version, modLoaderFilter, modQuery) {
+                        LaunchedEffect(modTargetInstance, catalogTarget?.version, modLoaderFilter, modQuery, catalogKind) {
                             kotlinx.coroutines.delay(350)
                             loadMods()
                         }
@@ -1601,7 +1833,7 @@ fun App() {
                             }
                             Spacer(Modifier.weight(1f))
                             var loaderMenuExpanded by remember { mutableStateOf(false) }
-                            Box {
+                            if (catalogKind == ContentKind.MOD) Box {
                                 TextButton(onClick = { loaderMenuExpanded = true }) { Text(tr("Загрузчик: {0}", tr(modLoaderFilter))) }
                                 DropdownMenu(expanded = loaderMenuExpanded, onDismissRequest = { loaderMenuExpanded = false }) {
                                     listOf("Все", "Fabric", "Forge", "NeoForge", "Quilt").forEach { loader -> DropdownMenuItem(text = { Text(tr(loader)) }, onClick = { modLoaderFilter = loader; loaderMenuExpanded = false }) }
@@ -1610,8 +1842,12 @@ fun App() {
                         }
                         if (catalogTarget != null) {
                             Text(
-                                if (modLoaderFilter == "Все") tr("Показаны моды для Minecraft {0}", catalogTarget.version)
-                                else tr("Показаны моды для Minecraft {0} и загрузчика {1}", catalogTarget.version, modLoaderFilter),
+                                when {
+                                    catalogKind == ContentKind.RESOURCEPACK -> tr("Показаны ресурспаки для Minecraft {0}", catalogTarget.version)
+                                    catalogKind == ContentKind.SHADER -> tr("Показаны шейдеры для Minecraft {0}. Для них в игре нужен мод Iris (Fabric и Quilt) или OptiFine.", catalogTarget.version)
+                                    modLoaderFilter == "Все" -> tr("Показаны моды для Minecraft {0}", catalogTarget.version)
+                                    else -> tr("Показаны моды для Minecraft {0} и загрузчика {1}", catalogTarget.version, modLoaderFilter)
+                                },
                                 color = TextMuted,
                                 fontSize = 12.sp
                             )
@@ -1624,7 +1860,7 @@ fun App() {
                             OutlinedTextField(
                                 value = modQuery,
                                 onValueChange = { modQuery = it },
-                                label = { Text(tr("Название мода")) },
+                                label = { Text(when (catalogKind) { ContentKind.MOD -> tr("Название мода"); ContentKind.RESOURCEPACK -> tr("Название ресурспака"); ContentKind.SHADER -> tr("Название шейдера") }) },
                                 singleLine = true,
                                 modifier = Modifier.weight(1f)
                             )
@@ -1646,7 +1882,7 @@ fun App() {
                         if (modsLoading) {
                             CircularProgressIndicator()
                         } else if (mods.isEmpty() && modsError == null) {
-                            Text(tr("Для этой версии Minecraft и загрузчика ничего не найдено."), color = TextMuted)
+                            Text(if (catalogKind == ContentKind.MOD) tr("Для этой версии Minecraft и загрузчика ничего не найдено.") else tr("Для этой версии Minecraft ничего не найдено."), color = TextMuted)
                         }
 
                         LazyColumn(
@@ -1694,6 +1930,11 @@ fun App() {
                                             Button(onClick = {
                                             val target = profiles.firstOrNull { it.name == modTargetInstance }
                                             if (target == null) { modInstallStatus = tr("Ошибка: сначала создай экземпляр") }
+                                            else if (catalogKind != ContentKind.MOD) scope.launch {
+                                                modInstallStatus = tr("Скачиваем {0}…", mod.title)
+                                                try { modInstallStatus = ModrinthApi.installContent(catalogKind, mod.id, target) { progress -> modInstallStatus = progress } }
+                                                catch (e: Exception) { modInstallStatus = tr("Ошибка установки {0}: {1}", mod.title, e.message ?: e.javaClass.simpleName) }
+                                            }
                                             else if (modLoaderFilter != "Все" && !target.loader.equals(modLoaderFilter, true)) { modInstallStatus = tr("Ошибка: выбранный экземпляр использует {0}, а фильтр — {1}", target.loader, modLoaderFilter) }
                                             else scope.launch {
                                                 modInstallStatus = tr("Скачиваем {0}…", mod.title)
@@ -1743,6 +1984,14 @@ fun App() {
                                 }
                             }
                             Spacer(Modifier.weight(1f))
+                            OutlinedButton(
+                                onClick = { checkModUpdates() },
+                                enabled = modTargetInstance.isNotBlank() && !modUpdateBusy
+                            ) {
+                                Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text(if (modUpdateBusy) tr("Проверяем…") else tr("Проверить обновления модов"))
+                            }
                             OutlinedButton(onClick = {
                                 installedModsStatus = ""
                                 installedModsRefresh += 1
@@ -1785,6 +2034,50 @@ fun App() {
                                 color = MaterialTheme.colorScheme.error,
                                 fontSize = 12.sp
                             )
+                        }
+
+                        if (modUpdateStatus.isNotBlank()) {
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                modUpdateStatus,
+                                color = if (I18n.isProblem(modUpdateStatus)) MaterialTheme.colorScheme.error else TextMuted,
+                                fontSize = 12.sp
+                            )
+                        }
+
+                        modUpdateCheck?.takeIf { it.updates.isNotEmpty() }?.let { check ->
+                            Spacer(Modifier.height(10.dp))
+                            Surface(
+                                color = AccentSoft,
+                                shape = RoundedCornerShape(14.dp),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, Accent.copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(tr("Доступно обновлений: {0}", check.updates.size), color = TextMain, fontWeight = FontWeight.SemiBold)
+                                        check.updates.take(6).forEach { update ->
+                                            Text(
+                                                "${update.title}: ${update.currentVersion} → ${update.newVersion}",
+                                                color = TextMuted,
+                                                fontSize = 12.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        if (check.updates.size > 6) {
+                                            Text(tr("и ещё {0}", check.updates.size - 6), color = TextMuted, fontSize = 12.sp)
+                                        }
+                                    }
+                                    Spacer(Modifier.width(12.dp))
+                                    Button(onClick = { applyModUpdates() }, enabled = !modUpdateBusy) {
+                                        Text(tr("Обновить все"))
+                                    }
+                                }
+                            }
                         }
 
                         Spacer(Modifier.height(10.dp))
@@ -2039,6 +2332,7 @@ fun App() {
                             listOf(
                                 "look" to "Внешний вид",
                                 "java" to "Java и память",
+                                "skin" to "Скин",
                                 "network" to "Сеть",
                                 "about" to "О лаунчере"
                             ).forEach { (tabId, tabLabel) ->
@@ -2206,6 +2500,10 @@ fun App() {
                             modifier = Modifier.fillMaxWidth()
                         )
 
+                        }
+
+                        if (settingsTab == "skin") {
+                            SkinSettings(offlineUsername.trim(), profiles)
                         }
 
                         if (settingsTab == "java") {
@@ -2567,6 +2865,9 @@ fun App() {
                                                 gameStatus = usernameProblem
                                             } else {
                                                 gameRunning = true
+                                                gameStopRequested = false
+                                                gameProcess = null
+                                                runningInstance = profile.name
                                                 gameStatus = tr("Запускаем Minecraft…")
 
                                                 val startedAt = System.currentTimeMillis()
@@ -2576,6 +2877,8 @@ fun App() {
                                                             kotlinx.coroutines.Dispatchers.IO
                                                         ) {
                                                             OfflineAccountPreferences.saveUsername(username)
+                                                            // Скин ника кладём в папку экземпляра для CustomSkinLoader (если скин выбран).
+                                                            try { OfflineSkins.applyTo(profile.name, username) } catch (_: Exception) { }
 
                                                             // Проверка файлов, выбор версии (для Forge это установленный
                                                             // профиль Forge) и запуск выполняются вне UI-потока.
@@ -2598,14 +2901,24 @@ fun App() {
                                                         if (result.success && process == null) {
                                                             gameStatus = tr("Процесс Minecraft не создан")
                                                         } else if (process != null) {
+                                                            gameProcess = process
+                                                            val playedAt = System.currentTimeMillis()
+                                                            profiles = profiles.map { if (it.name == profile.name) it.copy(lastPlayed = playedAt) else it }
+                                                            withContext(kotlinx.coroutines.Dispatchers.IO) { ProfileStore.save(profiles) }
                                                             val exitCode = withContext(
                                                                 kotlinx.coroutines.Dispatchers.IO
                                                             ) {
                                                                 process.waitFor()
                                                             }
+                                                            // Учитываем время игры (сессия короче секунды не считается).
+                                                            val sessionSeconds = (System.currentTimeMillis() - playedAt) / 1000
+                                                            profiles = PlayTime.add(profiles, profile.name, sessionSeconds)
+                                                            withContext(kotlinx.coroutines.Dispatchers.IO) { ProfileStore.save(profiles) }
 
                                                             // После падения ищем в журналах понятную причину.
-                                                            val crashHint = if (exitCode == 0) null else withContext(
+                                                            // Если игру закрыл сам пользователь кнопкой, это не сбой: без подсказок и ошибки.
+                                                            val stopped = gameStopRequested
+                                                            val crashHint = if (exitCode == 0 || stopped) null else withContext(
                                                                 kotlinx.coroutines.Dispatchers.IO
                                                             ) {
                                                                 try {
@@ -2617,9 +2930,11 @@ fun App() {
                                                                     null
                                                                 }
                                                             }
-                                                            if (exitCode != 0) logInstance = profile.name
+                                                            if (exitCode != 0 && !stopped) logInstance = profile.name
 
-                                                            gameStatus = if (exitCode == 0) {
+                                                            gameStatus = if (stopped) {
+                                                                tr("Minecraft закрыт")
+                                                            } else if (exitCode == 0) {
                                                                 tr("Minecraft завершил работу (код 0)")
                                                             } else {
                                                                 tr("Ошибка: Minecraft завершился с кодом {0}. ", exitCode) +
@@ -2632,16 +2947,21 @@ fun App() {
                                                             tr("Ошибка запуска: {0}", e.message ?: tr("неизвестная ошибка"))
                                                     } finally {
                                                         gameRunning = false
+                                                        gameProcess = null
+                                                        runningInstance = ""
                                                     }
                                                 }
                                             }
                                         }
                     }
-                    val shownProfiles = if (instanceQuery.isBlank()) profiles else profiles.filter {
-                        it.name.contains(instanceQuery.trim(), ignoreCase = true) ||
-                            it.version.contains(instanceQuery.trim(), ignoreCase = true) ||
-                            it.loader.contains(instanceQuery.trim(), ignoreCase = true)
-                    }
+                    val shownProfiles = InstanceSort.sort(
+                        if (instanceQuery.isBlank()) profiles else profiles.filter {
+                            it.name.contains(instanceQuery.trim(), ignoreCase = true) ||
+                                it.version.contains(instanceQuery.trim(), ignoreCase = true) ||
+                                it.loader.contains(instanceQuery.trim(), ignoreCase = true)
+                        },
+                        instanceSort
+                    )
                     if (shownProfiles.isEmpty()) {
                         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -2676,7 +2996,7 @@ fun App() {
                         modifier = if (shownProfiles.isEmpty()) Modifier.fillMaxWidth() else Modifier.weight(1f).fillMaxWidth(),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        contentPadding = PaddingValues(bottom = 8.dp)
+                        contentPadding = PaddingValues(top = 12.dp, bottom = 8.dp)
                     ) {
                         gridItems(shownProfiles, key = { it.name }) { profile ->
                             val selected = profile.name == selectedName
@@ -2688,7 +3008,7 @@ fun App() {
                                     if (selected) 1.5.dp else 1.dp,
                                     if (selected) Accent else Color.White.copy(alpha = 0.07f)
                                 ),
-                                modifier = Modifier.fillMaxWidth().height(128.dp)
+                                modifier = Modifier.fillMaxWidth().height(140.dp)
                                     .pointerInput(profile.name) {
                                         awaitPointerEventScope {
                                             while (true) {
@@ -2715,24 +3035,7 @@ fun App() {
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                     verticalArrangement = Arrangement.Center
                                 ) {
-                                    Surface(
-                                        color = if (selected) Accent.copy(alpha = 0.16f) else SurfaceB,
-                                        shape = RoundedCornerShape(14.dp),
-                                        modifier = Modifier.size(48.dp)
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Icon(
-                                                when (profile.loader.lowercase()) {
-                                                    "fabric" -> Icons.Default.Extension
-                                                    "forge" -> Icons.Default.Build
-                                                    else -> Icons.Default.Computer
-                                                },
-                                                contentDescription = null,
-                                                tint = if (selected) Accent else TextMuted,
-                                                modifier = Modifier.size(27.dp)
-                                            )
-                                        }
-                                    }
+                                    InstanceIconBadge(profile, selected)
                                     Spacer(Modifier.height(10.dp))
                                     Text(
                                         profile.name,
@@ -2749,6 +3052,33 @@ fun App() {
                                         fontSize = 10.sp,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
+                                    )
+                                    if (profile.playTimeSec >= 60) {
+                                        Spacer(Modifier.height(2.dp))
+                                        Text(
+                                            tr("Играл: {0}", PlayTime.format(profile.playTimeSec)),
+                                            color = TextMuted.copy(alpha = 0.8f),
+                                            fontSize = 10.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                            if (gameRunning && runningInstance == profile.name) {
+                                Surface(
+                                    color = Accent,
+                                    shape = RoundedCornerShape(50),
+                                    // Плашка сидит на верхней границе карточки: сверху над иконкой свободно, текст не закрывается.
+                                    modifier = Modifier.align(Alignment.TopCenter).offset(y = (-11).dp)
+                                ) {
+                                    Text(
+                                        if (gameProcess != null) tr("Запущен") else tr("Запуск…"),
+                                        color = Color(0xFF0B1F1B),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        // Шрифт добавляет лишнее место сверху, поэтому слегка поднимаем текст: он встаёт по центру плашки.
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp).offset(y = (-3).dp)
                                     )
                                 }
                             }
@@ -2786,6 +3116,27 @@ fun App() {
                                         settingsError = null
                                         contextMenuProfile = null
                                     }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(tr("Значок…")) },
+                                    leadingIcon = { Icon(Icons.Default.Palette, contentDescription = null) },
+                                    onClick = { iconTarget = profile; contextMenuProfile = null }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(tr("Миры и копии")) },
+                                    leadingIcon = { Icon(Icons.Default.Backup, contentDescription = null) },
+                                    onClick = { worldsTarget = profile; contextMenuProfile = null }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(tr("Экспорт в .mrpack")) },
+                                    leadingIcon = { Icon(Icons.Default.Upload, contentDescription = null) },
+                                    onClick = { exportTarget = profile; contextMenuProfile = null }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text(tr("Дублировать")) },
+                                    leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null) },
+                                    enabled = !packImportBusy && !installing,
+                                    onClick = { duplicateInstance(profile); contextMenuProfile = null }
                                 )
                                 DropdownMenuItem(
                                     text = { Text(tr("Удалить")) },
@@ -3013,6 +3364,28 @@ fun App() {
                                             )
                                         }
                                     }
+                                    val runningProcess = gameProcess
+                                    if (runningProcess != null) {
+                                        Button(
+                                            onClick = {
+                                                gameStopRequested = true
+                                                gameStatus = tr("Закрываем Minecraft…")
+                                                runningProcess.destroy()
+                                                // Если игра не закрылась за 5 секунд, завершаем принудительно.
+                                                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                                    if (!runningProcess.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                                                        runningProcess.destroyForcibly()
+                                                    }
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                                            modifier = Modifier.weight(1f).height(48.dp)
+                                        ) {
+                                            Icon(Icons.Default.Close, contentDescription = null)
+                                            Spacer(Modifier.width(8.dp))
+                                            Text(tr("Закрыть Minecraft"), maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    } else {
                                     Button(
                                     enabled = !installing && !gameRunning && selectedProfile != null,
                                     onClick = {
@@ -3025,7 +3398,8 @@ fun App() {
                                         contentDescription = null
                                     )
                                     Spacer(Modifier.width(8.dp))
-                                    Text(if (gameRunning) tr("Minecraft запущен…") else tr("Играть"), maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                    Text(if (gameRunning) tr("Запуск…") else tr("Играть"), maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                    }
                                     }
                                 }
 
@@ -3077,6 +3451,24 @@ fun App() {
                                     TextButton(onClick = { showAddOfflineAccountDialog = false }) { Text(tr("Отмена")) }
                                 }
                             )
+                        }
+
+                        iconTarget?.let { target ->
+                            IconPickerDialog(
+                                profile = target,
+                                onDismiss = { iconTarget = null },
+                                onSave = { updated ->
+                                    profiles = profiles.map { if (it.name == updated.name) updated else it }
+                                    ProfileStore.save(profiles)
+                                    iconTarget = null
+                                }
+                            )
+                        }
+                        worldsTarget?.let { target ->
+                            WorldsDialog(target, running = gameRunning && runningInstance == target.name, onDismiss = { worldsTarget = null })
+                        }
+                        exportTarget?.let { target ->
+                            ExportPackDialog(target, onDismiss = { exportTarget = null })
                         }
 
                         if (settingsTarget != null) {
@@ -3183,7 +3575,11 @@ fun App() {
                                             (showSnapshots && version.type == "snapshot") ||
                                             (showAlphaBeta && version.type in setOf("old_alpha", "old_beta"))
                                     }
-                                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    // Окно длинное: на небольшом экране содержимое прокручивается, а кнопки остаются на месте.
+                                    Column(
+                                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
                                         ExposedDropdownMenuBox(
                                             expanded = versionMenuExpanded,
                                             onExpandedChange = { versionMenuExpanded = it }
@@ -3316,6 +3712,24 @@ fun App() {
                                         )
                                         createError?.let {
                                             Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                                        }
+                                        HorizontalDivider()
+                                        Text(
+                                            tr("Уже есть готовая сборка с Modrinth? Импортируй её файлом .mrpack."),
+                                            color = TextMuted,
+                                            fontSize = 11.sp
+                                        )
+                                        OutlinedButton(
+                                            onClick = {
+                                                showCreateDialog = false
+                                                importPack()
+                                            },
+                                            enabled = !packImportBusy && !installing,
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Icon(Icons.Default.Download, contentDescription = null)
+                                            Spacer(Modifier.width(6.dp))
+                                            Text(tr("Импорт сборки .mrpack…"))
                                         }
                                     }
                                 },
