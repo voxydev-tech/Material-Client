@@ -7,7 +7,7 @@ import java.io.File
 
 /** Версия этого лаунчера. Меняй её вместе с `version` и `packageVersion` в composeApp/build.gradle.kts. */
 internal object AppInfo {
-    const val VERSION = "1.0.0"
+    const val VERSION = "1.0.1"
 
     /** Репозиторий релизов по умолчанию («владелец/имя»). Пользователь может задать свой в «О лаунчере». */
     const val DEFAULT_REPO = "voxydev-tech/Material-Client"
@@ -113,6 +113,39 @@ internal object Updater {
             throw e
         }
         return pick(JsonParser.parseString(text).asJsonArray, current)
+    }
+
+    /**
+     * Запускает скачанный установщик. Способы пробуются по очереди: системное «открыть», PowerShell, cmd и прямой запуск.
+     * Возвращает null, если один из них сработал, иначе подробности всех неудач (для журнала).
+     */
+    fun launch(file: File): String? {
+        val errors = mutableListOf<String>()
+        val path = file.absolutePath
+        fun attempt(name: String, action: () -> Unit): Boolean = try {
+            action()
+            true
+        } catch (e: Exception) {
+            errors += "$name: ${e.message ?: e.javaClass.simpleName}"
+            false
+        }
+        fun runAndCheck(vararg command: String) {
+            val process = ProcessBuilder(*command).redirectErrorStream(true).start()
+            if (process.waitFor(20, java.util.concurrent.TimeUnit.SECONDS)) {
+                val code = process.exitValue()
+                if (code != 0) error("код выхода $code: " + process.inputStream.bufferedReader().readText().trim().take(300))
+            }
+        }
+        if (attempt("Desktop.open") { java.awt.Desktop.getDesktop().open(file) }) return null
+        val quoted = path.replace("'", "''")
+        if (attempt("PowerShell") { runAndCheck("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Start-Process -FilePath '$quoted'") }) return null
+        if (attempt("cmd start") { runAndCheck("cmd", "/c", "start", "", path) }) return null
+        if (attempt("прямой запуск") {
+                val process = ProcessBuilder(path).start()
+                if (process.waitFor(2, java.util.concurrent.TimeUnit.SECONDS) && process.exitValue() != 0) error("код выхода ${process.exitValue()}")
+            }
+        ) return null
+        return errors.joinToString("\n")
     }
 
     /**

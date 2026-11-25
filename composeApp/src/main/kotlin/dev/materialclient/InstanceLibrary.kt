@@ -92,6 +92,6 @@ internal object InstanceCopy {
             if (created) to.toFile().deleteRecursively() else to.toFile().listFiles()?.forEach { it.deleteRecursively() }
             throw e
         }
-        return source.copy(name = newName, lastPlayed = 0L)
+        return source.copy(name = newName, lastPlayed = 0L, playTimeSec = 0L)
     }
 }

@@ -166,6 +166,7 @@ private object ProfileStore {
         }
     }
 
+    @Synchronized
     fun save(instances: List<Instance>) {
         try {
             file.parentFile.mkdirs()
@@ -182,8 +183,15 @@ private object ProfileStore {
                 p.setProperty("profile.$i.iconColor", instance.iconColor)
                 p.setProperty("profile.$i.playTime", instance.playTimeSec.toString())
             }
-            file.outputStream().use {
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.outputStream().use {
                 p.store(it, "Material Client profiles")
+            }
+            try {
+                java.nio.file.Files.move(tmp.toPath(), file.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+            } catch (_: Exception) {
+                java.nio.file.Files.move(tmp.toPath(), file.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -1401,7 +1409,20 @@ fun App() {
                     }
                 }
                 updateStatus = tr("Запускаем установщик…")
-                withContext(Dispatchers.IO) { java.awt.Desktop.getDesktop().open(file) }
+                val launchError = withContext(Dispatchers.IO) { Updater.launch(file) }
+                if (launchError != null) {
+                    // Установщик скачан, но Windows не дал его запустить: подробности в журнал, папку с файлом открываем.
+                    withContext(Dispatchers.IO) {
+                        try {
+                            val log = File(LauncherPaths.root, "logs/update.log")
+                            log.parentFile.mkdirs()
+                            log.appendText("${java.util.Date()} ${file.absolutePath}\n$launchError\n\n")
+                        } catch (_: Exception) { }
+                        try { ProcessBuilder("explorer.exe", "/select,${file.absolutePath}").start() } catch (_: Exception) { }
+                    }
+                    updateStatus = tr("Ошибка: установщик скачан, но не запустился сам. Запусти его вручную: {0}", file.absolutePath)
+                    return@launch
+                }
                 // Установщик заменяет файлы лаунчера, поэтому сам лаунчер закрывается.
                 kotlinx.coroutines.delay(800)
                 System.exit(0)
@@ -1647,7 +1668,7 @@ fun App() {
                                     else updateStatus.ifBlank { tr("Сейчас у тебя {0}", AppInfo.VERSION) },
                                     color = if (I18n.isProblem(updateStatus)) MaterialTheme.colorScheme.error else TextMuted,
                                     fontSize = 12.sp,
-                                    maxLines = 2,
+                                    maxLines = 4,
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }

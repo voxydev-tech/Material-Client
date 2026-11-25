@@ -159,8 +159,17 @@ internal fun IconPickerDialog(profile: Instance, onDismiss: () -> Unit, onSave: 
     var color by remember { mutableStateOf(profile.iconColor) }
     var status by remember { mutableStateOf("") }
     val preview = profile.copy(icon = key, iconColor = color)
+    // Картинка пишется на диск сразу, поэтому запоминаем исходную, чтобы «Отмена» ничего не меняла.
+    val originalImage = remember { runCatching { InstanceIcons.imageFile(profile.name).takeIf { it.isFile }?.readBytes() }.getOrNull() }
+    fun cancel() {
+        runCatching {
+            val f = InstanceIcons.imageFile(profile.name)
+            if (originalImage != null) f.writeBytes(originalImage) else f.delete()
+        }
+        onDismiss()
+    }
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { cancel() },
         title = { Text(tr("Значок экземпляра")) },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -224,7 +233,7 @@ internal fun IconPickerDialog(profile: Instance, onDismiss: () -> Unit, onSave: 
             }
         },
         confirmButton = { Button(onClick = { onSave(profile.copy(icon = InstanceIcons.normalizeKey(key), iconColor = InstanceIcons.normalizeColor(color))) }) { Text(tr("Сохранить")) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text(tr("Отмена")) } }
+        dismissButton = { TextButton(onClick = { cancel() }) { Text(tr("Отмена")) } }
     )
 }
 

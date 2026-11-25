@@ -35,14 +35,14 @@ internal object InstanceIcons {
 
     /** Своя картинка: проверяется, обрезается до квадрата по центру и сохраняется как icon.png 128×128. */
     fun setImage(instanceName: String, source: File) {
-        require(source.isFile && source.length() in 1..MAX_SOURCE_BYTES) { tr("Картинка не подходит: нужен PNG или JPG до 8 МБ.") }
+        require(source.isFile && source.length() in 1..MAX_SOURCE_BYTES) { tr("Не удалось использовать картинку: нужен PNG или JPG до 8 МБ.") }
         val image = try {
             ImageIO.read(source)
         } catch (_: Exception) {
             null
-        } ?: error(tr("Картинка не подходит: нужен PNG или JPG до 8 МБ."))
+        } ?: error(tr("Не удалось использовать картинку: нужен PNG или JPG до 8 МБ."))
         val side = minOf(image.width, image.height)
-        require(side >= 16) { tr("Картинка слишком маленькая (минимум 16×16).") }
+        require(side >= 16) { tr("Не удалось использовать картинку: она слишком маленькая (минимум 16×16).") }
         val square = image.getSubimage((image.width - side) / 2, (image.height - side) / 2, side, side)
         val out = BufferedImage(SIZE, SIZE, BufferedImage.TYPE_INT_ARGB)
         val g = out.createGraphics()
@@ -242,13 +242,13 @@ internal object OfflineSkins {
 
     /** Проверяет PNG: 64×64 или 64×32. */
     fun validate(file: File): BufferedImage {
-        require(file.isFile && file.length() in 1..1_048_576) { tr("Скин не подходит: нужен PNG 64×64 или 64×32 до 1 МБ.") }
+        require(file.isFile && file.length() in 1..1_048_576) { tr("Не удалось использовать скин: нужен PNG 64×64 или 64×32 до 1 МБ.") }
         val image = try {
             ImageIO.read(file)
         } catch (_: Exception) {
             null
-        } ?: error(tr("Скин не подходит: нужен PNG 64×64 или 64×32 до 1 МБ."))
-        require(image.width == 64 && (image.height == 64 || image.height == 32)) { tr("Скин не подходит: нужен PNG 64×64 или 64×32 до 1 МБ.") }
+        } ?: error(tr("Не удалось использовать скин: нужен PNG 64×64 или 64×32 до 1 МБ."))
+        require(image.width == 64 && (image.height == 64 || image.height == 32)) { tr("Не удалось использовать скин: нужен PNG 64×64 или 64×32 до 1 МБ.") }
         return image
     }
 
